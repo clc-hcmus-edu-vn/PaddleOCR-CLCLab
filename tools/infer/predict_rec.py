@@ -26,7 +26,6 @@ import numpy as np
 import math
 import time
 import traceback
-import paddle
 
 import tools.infer.utility as utility
 from ppocr.postprocess import build_post_process
@@ -228,6 +227,35 @@ class TextRecognizer(object):
         resized_image /= 0.5
         padding_im = np.zeros((imgC, imgH, imgW), dtype=np.float32)
         padding_im[:, :, 0:resized_w] = resized_image
+        return padding_im
+
+    def resize_norm_img_svtr_lcnet(
+        self, img, image_shape, padding=True, interpolation=cv2.INTER_LINEAR
+    ):
+        imgC, imgH, imgW = image_shape
+        h = img.shape[0]
+        w = img.shape[1]
+        if not padding:
+            resized_image = cv2.resize(img, (imgW, imgH), interpolation=interpolation)
+            resized_w = imgW
+        else:
+            ratio = w / float(h)
+            if math.ceil(imgH * ratio) > imgW:
+                resized_w = imgW
+            else:
+                resized_w = int(math.ceil(imgH * ratio))
+            resized_image = cv2.resize(img, (resized_w, imgH))
+        resized_image = resized_image.astype("float32")
+        if image_shape[0] == 1:
+            resized_image = resized_image / 255
+            resized_image = resized_image[np.newaxis, :]
+        else:
+            resized_image = resized_image.transpose((2, 0, 1)) / 255
+        resized_image -= 0.5
+        resized_image /= 0.5
+        padding_im = np.zeros((imgC, imgH, imgW), dtype=np.float32)
+        padding_im[:, :, 0:resized_w] = resized_image
+        min(1.0, float(resized_w / imgW))
         return padding_im
 
     def resize_norm_img_vl(self, img, image_shape):
@@ -645,6 +673,12 @@ class TextRecognizer(object):
                     norm_img = self.norm_img_latexocr(img_list[indices[ino]])
                     norm_img = norm_img[np.newaxis, :]
                     norm_img_batch.append(norm_img)
+                elif self.rec_algorithm == "SVTR_LCNet":
+                    norm_img = self.resize_norm_img_svtr_lcnet(
+                        img_list[indices[ino]], self.rec_image_shape
+                    )
+                    norm_img = norm_img[np.newaxis, :]
+                    norm_img_batch.append(norm_img)
                 else:
                     norm_img = self.resize_norm_img(
                         img_list[indices[ino]], max_wh_ratio
@@ -845,7 +879,7 @@ def main(args):
     if args.warmup:
         img = np.random.uniform(0, 255, [48, 320, 3]).astype(np.uint8)
         for i in range(2):
-            res = text_recognizer([img] * int(args.rec_batch_num))
+            text_recognizer([img] * int(args.rec_batch_num))
 
     for image_file in image_file_list:
         img, flag, _ = check_and_read(image_file)
