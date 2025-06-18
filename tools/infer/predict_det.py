@@ -40,6 +40,7 @@ class TextDetector(object):
         self.args = args
         self.det_algorithm = args.det_algorithm
         self.use_onnx = args.use_onnx
+        self.bbox_padding = getattr(args, 'bbox_padding', None)
         pre_process_list = [
             {
                 "DetResizeForTest": {
@@ -227,6 +228,82 @@ class TextDetector(object):
         dt_boxes = np.array(dt_boxes_new)
         return dt_boxes
 
+    def apply_bbox_padding(self, dt_boxes, image_shape):
+        """
+        Apply padding to bounding boxes.
+        
+        Args:
+            dt_boxes: numpy array of bounding boxes with shape (N, 4, 2)
+            image_shape: tuple of (height, width) of the image
+            
+        Returns:
+            numpy array of padded bounding boxes
+        """
+        if self.bbox_padding is None or len(dt_boxes) == 0:
+            return dt_boxes
+            
+        img_height, img_width = image_shape[0:2]
+        
+        # bbox_padding should be [left, top, right, bottom]
+        if isinstance(self.bbox_padding, (list, tuple)) and len(self.bbox_padding) == 4:
+            left_pad, top_pad, right_pad, bottom_pad = self.bbox_padding
+        else:
+            # If single value, apply to all sides
+            left_pad = top_pad = right_pad = bottom_pad = self.bbox_padding
+            
+        padded_boxes = []
+        for box in dt_boxes:
+            if type(box) is list:
+                box = np.array(box)
+            
+            # Get min/max coordinates
+            min_x = np.min(box[:, 0])
+            max_x = np.max(box[:, 0])
+            min_y = np.min(box[:, 1])
+            max_y = np.max(box[:, 1])
+            
+            # Apply padding
+            new_min_x = max(0, min_x - left_pad)
+            new_max_x = min(img_width - 1, max_x + right_pad)
+            new_min_y = max(0, min_y - top_pad)
+            new_max_y = min(img_height - 1, max_y + bottom_pad)
+            
+            # Create new box with padded coordinates
+            if len(box) == 4:  # Rectangle box
+                padded_box = np.array([
+                    [new_min_x, new_min_y],
+                    [new_max_x, new_min_y],
+                    [new_max_x, new_max_y],
+                    [new_min_x, new_max_y]
+                ], dtype=np.float32)
+            else:  # Polygon box - expand proportionally
+                # Calculate padding ratios
+                x_ratio_left = (min_x - new_min_x) / (max_x - min_x) if max_x != min_x else 0
+                x_ratio_right = (new_max_x - max_x) / (max_x - min_x) if max_x != min_x else 0
+                y_ratio_top = (min_y - new_min_y) / (max_y - min_y) if max_y != min_y else 0
+                y_ratio_bottom = (new_max_y - max_y) / (max_y - min_y) if max_y != min_y else 0
+                
+                padded_box = box.copy()
+                for i in range(len(box)):
+                    # Expand each point proportionally
+                    if box[i, 0] <= (min_x + max_x) / 2:  # Left side
+                        padded_box[i, 0] = box[i, 0] - x_ratio_left * (max_x - min_x)
+                    else:  # Right side
+                        padded_box[i, 0] = box[i, 0] + x_ratio_right * (max_x - min_x)
+                        
+                    if box[i, 1] <= (min_y + max_y) / 2:  # Top side
+                        padded_box[i, 1] = box[i, 1] - y_ratio_top * (max_y - min_y)
+                    else:  # Bottom side
+                        padded_box[i, 1] = box[i, 1] + y_ratio_bottom * (max_y - min_y)
+                
+                # Clip to image boundaries
+                padded_box[:, 0] = np.clip(padded_box[:, 0], 0, img_width - 1)
+                padded_box[:, 1] = np.clip(padded_box[:, 1], 0, img_height - 1)
+            
+            padded_boxes.append(padded_box)
+        
+        return np.array(padded_boxes) if padded_boxes else dt_boxes
+
     def predict(self, img):
         ori_im = img.copy()
         data = {"image": img}
@@ -287,6 +364,8 @@ class TextDetector(object):
             dt_boxes = self.filter_tag_det_res_only_clip(dt_boxes, ori_im.shape)
         else:
             dt_boxes = self.filter_tag_det_res(dt_boxes, ori_im.shape)
+
+        dt_boxes = self.apply_bbox_padding(dt_boxes, ori_im.shape)
 
         if self.args.benchmark:
             self.autolog.times.end(stamp=True)

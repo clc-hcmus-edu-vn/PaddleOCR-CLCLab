@@ -86,6 +86,11 @@ def init_args():
     parser.add_argument("--det_pse_min_area", type=float, default=16)
     parser.add_argument("--det_pse_scale", type=int, default=1)
 
+    # Bbox padding params
+    parser.add_argument("--bbox_padding", 
+                       help="Padding for bounding boxes. Can be a single value for all sides or a list [left, top, right, bottom]",
+                       default=None)
+
     # FCE params
     parser.add_argument("--scales", type=list, default=[8, 16, 32])
     parser.add_argument("--alpha", type=float, default=1.0)
