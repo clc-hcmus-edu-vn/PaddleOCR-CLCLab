@@ -125,11 +125,20 @@ class OCRRec(hub.Module):
         try:
             rec_res, predict_time = self.text_recognizer(img_list)
             for dno in range(len(rec_res)):
-                text, score = rec_res[dno]
+                text, score, *topk_predictions = rec_res[dno]
                 rec_res_final.append(
                     {
                         "text": text,
                         "confidence": float(score),
+                        # Matches BERT_Inference_PostProcessing's versioned
+                        # input: {"text": ..., "details": [...]}
+                        "details": [
+                            {
+                                "chars": [char for char, _ in candidates],
+                                "scores": [score for _, score in candidates],
+                            }
+                            for candidates in (topk_predictions[0] if topk_predictions else [])
+                        ],
                     }
                 )
         except Exception as e:
