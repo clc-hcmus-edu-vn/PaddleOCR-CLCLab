@@ -567,6 +567,95 @@ class TextRecognizer(object):
         img = img.astype("float32")
         return img
 
+    def ctc_decode_with_probs(self, preds, char_list):
+        """
+        return:
+            [(text, probs, char_positions)]
+        """
+
+        if isinstance(preds, dict):
+            preds = preds["predict"]
+
+        logits = preds
+        pred_idx = logits.argmax(axis=2)
+        pred_prob = logits.max(axis=2)
+
+        results = []
+
+        for idx_seq, prob_seq in zip(pred_idx, pred_prob):
+
+            chars = []
+            probs = []
+            char_positions = []   # 🔥 NEW
+
+            prev = -1
+
+            for t, idx in enumerate(idx_seq):
+
+                if idx == 0:
+                    prev = idx
+                    continue
+
+                if idx != prev and idx != 0:
+                    chars.append(char_list[idx])
+                    probs.append(float(prob_seq[t]))
+                    char_positions.append(t)   # 🔥 mapping timestep → char
+
+                prev = idx
+
+            text = "".join(chars)
+            results.append((text, probs, char_positions))
+
+        return results
+
+    def get_topk_chars_per_position(self, preds, char_list, k=20):
+        """
+        preds: (B, T, vocab)
+        return: list[B] -> list[T] -> list[(char, prob)]
+        """
+
+        if isinstance(preds, dict):
+            preds = preds["predict"]
+
+        probs = preds  # đảm bảo đã softmax
+
+        batch_topk = []
+
+        for b in range(probs.shape[0]):
+            seq = probs[b]  # (T, vocab)
+
+            # 🔥 lấy dư để tránh mất do blank
+            topk_idx = np.argsort(-seq, axis=1)[:, :k+5]
+            topk_prob = np.take_along_axis(seq, topk_idx, axis=1)
+
+            seq_result = []
+
+            for t in range(seq.shape[0]):
+                step = []
+
+                for i in range(topk_idx.shape[1]):
+                    idx = topk_idx[t][i]
+
+                    # skip blank
+                    if idx == 0:
+                        continue
+
+                    # ⚠️ check index mapping
+                    char = char_list[idx]  # hoặc idx-1 nếu cần
+                    prob = float(topk_prob[t][i])
+
+                    step.append((char, prob))
+
+                    # 🔥 đảm bảo đủ k
+                    if len(step) == k:
+                        break
+
+                seq_result.append(step)
+
+            batch_topk.append(seq_result)
+
+        return batch_topk
+
     def __call__(self, img_list):
         img_num = len(img_list)
         # Calculate the aspect ratio of all text bars
@@ -575,7 +664,8 @@ class TextRecognizer(object):
             width_list.append(img.shape[1] / float(img.shape[0]))
         # Sorting can speed up the recognition process
         indices = np.argsort(np.array(width_list))
-        rec_res = [["", 0.0]] * img_num
+        # rec_res = [["", 0.0]] * img_num
+        rec_res = [None] * img_num
         batch_num = self.rec_batch_num
         st = time.time()
         if self.benchmark:
@@ -836,19 +926,45 @@ class TextRecognizer(object):
                     else:
                         preds = outputs[0]
             if self.postprocess_params["name"] == "CTCLabelDecode":
-                rec_result = self.postprocess_op(
-                    preds,
-                    return_word_box=self.return_word_box,
-                    wh_ratio_list=wh_ratio_list,
-                    max_wh_ratio=max_wh_ratio,
-                )
+                char_list = self.postprocess_op.character
+                char_probs = [None] * img_num
+                decoded = self.ctc_decode_with_probs(preds, char_list)
+                topk_batch = self.get_topk_chars_per_position(preds, char_list, k=10)
+
+                for i, (text, probs, char_positions) in enumerate(decoded):
+                    topk_seq = topk_batch[i]   # (T, k)
+                    aligned_topk = []
+                    aligned_topk = []
+                    for i_char, t in enumerate(char_positions):
+                        if t < len(topk_seq):
+                            step = topk_seq[t].copy()
+                        else:
+                            step = []
+                        char = text[i_char]
+                        prob = float(probs[i_char])
+                        if step:
+                            chars_in_step = [c for c, _ in step]
+                            if char not in chars_in_step:
+                                step = [(char, prob)] + step[:-1]
+                        else:
+                            step = [(char, prob)]
+                        aligned_topk.append(step)
+                    score = float(np.mean(probs)) if len(probs) > 0 else 0.0
+                    idx = indices[beg_img_no + i]
+                    char_probs[idx] = {
+                        "probs": probs,
+                        "topk": aligned_topk
+                    }
+                    idx = indices[beg_img_no + i]
+                    rec_res[idx] = (text, score, char_probs)
+
             elif self.postprocess_params["name"] == "LaTeXOCRDecode":
                 preds = [p.reshape([-1]) for p in preds]
                 rec_result = self.postprocess_op(preds)
             else:
                 rec_result = self.postprocess_op(preds)
-            for rno in range(len(rec_result)):
-                rec_res[indices[beg_img_no + rno]] = rec_result[rno]
+            # for rno in range(len(rec_result)):
+            #     rec_res[indices[beg_img_no + rno]] = rec_result[rno]
             if self.benchmark:
                 self.autolog.times.end(stamp=True)
         return rec_res, time.time() - st
