@@ -34,6 +34,10 @@ from ppocr.utils.utility import get_image_file_list, check_and_read
 
 logger = get_logger()
 
+# The BERT post-processing service consumes up to 12 OCR alternatives for each
+# decoded character.  Keep this in one place so callers receive a consistent
+# candidate-list size from the CTC recognizer.
+CTC_TOP_K_PREDICTIONS = 12
 
 class TextRecognizer(object):
     def __init__(self, args, logger=None):
@@ -483,6 +487,62 @@ class TextRecognizer(object):
 
         return img
 
+    @staticmethod
+    def _ctc_topk_predictions(preds, character, top_k=CTC_TOP_K_PREDICTIONS):
+        """Return CTC candidates aligned to each decoded character.
+
+        The result is indexed as ``[batch][character_position]`` and every
+        position contains ``[(character, probability), ...]``.  CTC blank
+        (index 0) is excluded, while the decoded top-1 character remains the
+        first candidate.  This is the shape consumed by the BERT
+        post-processing input after associating each inner list with its
+        character position.
+        """
+        if isinstance(preds, dict):
+            preds = preds["predict"]
+        elif isinstance(preds, (tuple, list)):
+            preds = preds[-1]
+
+        if hasattr(preds, "numpy"):
+            preds = preds.numpy()
+        probabilities = np.asarray(preds)
+        if probabilities.ndim != 3:
+            raise ValueError(
+                "CTC predictions must have shape [batch, time, vocabulary]; "
+                f"received {probabilities.shape}"
+            )
+
+        candidate_count = min(top_k + 1, probabilities.shape[2])
+        ranked_indices = np.argsort(-probabilities, axis=2)[:, :, :candidate_count]
+        ranked_probabilities = np.take_along_axis(
+            probabilities, ranked_indices, axis=2
+        )
+
+        batch_predictions = []
+        for sample_indices, sample_probabilities in zip(
+            ranked_indices, ranked_probabilities
+        ):
+            aligned_predictions = []
+            previous_index = -1
+            for timestep, best_index in enumerate(sample_indices[:, 0]):
+                # Match CTCLabelDecode: ignore blank and collapse repeats.
+                if best_index != 0 and best_index != previous_index:
+                    candidates = []
+                    for candidate_index, candidate_probability in zip(
+                        sample_indices[timestep], sample_probabilities[timestep]
+                    ):
+                        if candidate_index == 0:
+                            continue
+                        candidates.append(
+                            (character[candidate_index], float(candidate_probability))
+                        )
+                        if len(candidates) == top_k:
+                            break
+                    aligned_predictions.append(candidates)
+                previous_index = best_index
+            batch_predictions.append(aligned_predictions)
+        return batch_predictions
+        
     def pad_(self, img, divable=32):
         threshold = 128
         data = np.array(img.convert("LA"))
@@ -926,45 +986,34 @@ class TextRecognizer(object):
                     else:
                         preds = outputs[0]
             if self.postprocess_params["name"] == "CTCLabelDecode":
-                char_list = self.postprocess_op.character
-                char_probs = [None] * img_num
-                decoded = self.ctc_decode_with_probs(preds, char_list)
-                topk_batch = self.get_topk_chars_per_position(preds, char_list, k=10)
-
-                for i, (text, probs, char_positions) in enumerate(decoded):
-                    topk_seq = topk_batch[i]   # (T, k)
-                    aligned_topk = []
-                    aligned_topk = []
-                    for i_char, t in enumerate(char_positions):
-                        if t < len(topk_seq):
-                            step = topk_seq[t].copy()
-                        else:
-                            step = []
-                        char = text[i_char]
-                        prob = float(probs[i_char])
-                        if step:
-                            chars_in_step = [c for c, _ in step]
-                            if char not in chars_in_step:
-                                step = [(char, prob)] + step[:-1]
-                        else:
-                            step = [(char, prob)]
-                        aligned_topk.append(step)
-                    score = float(np.mean(probs)) if len(probs) > 0 else 0.0
-                    idx = indices[beg_img_no + i]
-                    char_probs[idx] = {
-                        "probs": probs,
-                        "topk": aligned_topk
-                    }
-                    idx = indices[beg_img_no + i]
-                    rec_res[idx] = (text, score, char_probs)
+                rec_result = self.postprocess_op(
+                    preds,
+                    return_word_box=self.return_word_box,
+                    wh_ratio_list=wh_ratio_list,
+                    max_wh_ratio=max_wh_ratio,
+                )
+                # Do not retain probability data on ``self``: it belongs to
+                # this invocation and travels with the matching recognition
+                # result.  ``return_word_box`` keeps PaddleOCR's established
+                # third tuple element for word-box metadata.
+                if not self.return_word_box:
+                    topk_batch = self._ctc_topk_predictions(
+                        preds, self.postprocess_op.character
+                    )
+                    rec_result = [
+                        (text, confidence, topk_predictions)
+                        for (text, confidence), topk_predictions in zip(
+                            rec_result, topk_batch
+                        )
+                    ]
 
             elif self.postprocess_params["name"] == "LaTeXOCRDecode":
                 preds = [p.reshape([-1]) for p in preds]
                 rec_result = self.postprocess_op(preds)
             else:
                 rec_result = self.postprocess_op(preds)
-            # for rno in range(len(rec_result)):
-            #     rec_res[indices[beg_img_no + rno]] = rec_result[rno]
+            for rno in range(len(rec_result)):
+                rec_res[indices[beg_img_no + rno]] = rec_result[rno]
             if self.benchmark:
                 self.autolog.times.end(stamp=True)
         return rec_res, time.time() - st

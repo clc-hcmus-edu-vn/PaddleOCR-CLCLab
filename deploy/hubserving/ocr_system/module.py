@@ -133,12 +133,21 @@ class OCRSystem(hub.Module):
             rec_res_final = []
 
             for dno in range(dt_num):
-                text, score = rec_res[dno]
+                text, score, *topk_predictions = rec_res[dno]
                 rec_res_final.append(
                     {
                         "text": text,
                         "confidence": float(score),
                         "text_region": dt_boxes[dno].astype(np.int32).tolist(),
+                        # Matches BERT_Inference_PostProcessing's versioned
+                        # input: {"text": ..., "details": [...]}
+                        "details": [
+                            {
+                                "chars": [char for char, _ in candidates],
+                                "scores": [score for _, score in candidates],
+                            }
+                            for candidates in (topk_predictions[0] if topk_predictions else [])
+                        ],
                     }
                 )
             all_results.append(rec_res_final)
