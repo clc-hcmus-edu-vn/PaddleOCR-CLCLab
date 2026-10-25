@@ -238,7 +238,7 @@ def main(args):
                 logger.debug(
                     str(idx) + "  Predict time of %s: %.3fs" % (image_file, elapse)
                 )
-            for text, score in rec_res:
+            for text, score, *_ in rec_res:
                 logger.debug("{}, {:.3f}".format(text, score))
 
             res = [
