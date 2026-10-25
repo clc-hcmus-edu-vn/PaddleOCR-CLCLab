@@ -26,6 +26,7 @@ import numpy as np
 import math
 import time
 import traceback
+import paddle
 
 import tools.infer.utility as utility
 from ppocr.postprocess import build_post_process
@@ -39,8 +40,30 @@ logger = get_logger()
 # candidate-list size from the CTC recognizer.
 CTC_TOP_K_PREDICTIONS = 12
 
+
 class TextRecognizer(object):
     def __init__(self, args, logger=None):
+        if os.path.exists(f"{args.rec_model_dir}/inference.yml"):
+            model_config = utility.load_config(f"{args.rec_model_dir}/inference.yml")
+            model_name = model_config.get("Global", {}).get("model_name", "")
+            if model_name and model_name not in [
+                "PP-OCRv5_mobile_rec",
+                "PP-OCRv5_server_rec",
+            ]:
+                raise ValueError(
+                    f"{model_name} is not supported. Please check if the model is supported by the PaddleOCR wheel."
+                )
+
+            if args.rec_char_dict_path == "./ppocr/utils/ppocr_keys_v1.txt":
+                rec_char_list = model_config.get("PostProcess", {}).get(
+                    "character_dict", []
+                )
+                if rec_char_list:
+                    new_rec_char_dict_path = f"{args.rec_model_dir}/ppocr_keys.txt"
+                    with open(new_rec_char_dict_path, "w", encoding="utf-8") as f:
+                        f.writelines([char + "\n" for char in rec_char_list])
+                    args.rec_char_dict_path = new_rec_char_dict_path
+
         if logger is None:
             logger = get_logger()
         self.rec_image_shape = [int(v) for v in args.rec_image_shape.split(",")]
@@ -231,35 +254,6 @@ class TextRecognizer(object):
         resized_image /= 0.5
         padding_im = np.zeros((imgC, imgH, imgW), dtype=np.float32)
         padding_im[:, :, 0:resized_w] = resized_image
-        return padding_im
-
-    def resize_norm_img_svtr_lcnet(
-        self, img, image_shape, padding=True, interpolation=cv2.INTER_LINEAR
-    ):
-        imgC, imgH, imgW = image_shape
-        h = img.shape[0]
-        w = img.shape[1]
-        if not padding:
-            resized_image = cv2.resize(img, (imgW, imgH), interpolation=interpolation)
-            resized_w = imgW
-        else:
-            ratio = w / float(h)
-            if math.ceil(imgH * ratio) > imgW:
-                resized_w = imgW
-            else:
-                resized_w = int(math.ceil(imgH * ratio))
-            resized_image = cv2.resize(img, (resized_w, imgH))
-        resized_image = resized_image.astype("float32")
-        if image_shape[0] == 1:
-            resized_image = resized_image / 255
-            resized_image = resized_image[np.newaxis, :]
-        else:
-            resized_image = resized_image.transpose((2, 0, 1)) / 255
-        resized_image -= 0.5
-        resized_image /= 0.5
-        padding_im = np.zeros((imgC, imgH, imgW), dtype=np.float32)
-        padding_im[:, :, 0:resized_w] = resized_image
-        min(1.0, float(resized_w / imgW))
         return padding_im
 
     def resize_norm_img_vl(self, img, image_shape):
@@ -542,7 +536,7 @@ class TextRecognizer(object):
                 previous_index = best_index
             batch_predictions.append(aligned_predictions)
         return batch_predictions
-        
+
     def pad_(self, img, divable=32):
         threshold = 128
         data = np.array(img.convert("LA"))
@@ -627,95 +621,6 @@ class TextRecognizer(object):
         img = img.astype("float32")
         return img
 
-    def ctc_decode_with_probs(self, preds, char_list):
-        """
-        return:
-            [(text, probs, char_positions)]
-        """
-
-        if isinstance(preds, dict):
-            preds = preds["predict"]
-
-        logits = preds
-        pred_idx = logits.argmax(axis=2)
-        pred_prob = logits.max(axis=2)
-
-        results = []
-
-        for idx_seq, prob_seq in zip(pred_idx, pred_prob):
-
-            chars = []
-            probs = []
-            char_positions = []   # 🔥 NEW
-
-            prev = -1
-
-            for t, idx in enumerate(idx_seq):
-
-                if idx == 0:
-                    prev = idx
-                    continue
-
-                if idx != prev and idx != 0:
-                    chars.append(char_list[idx])
-                    probs.append(float(prob_seq[t]))
-                    char_positions.append(t)   # 🔥 mapping timestep → char
-
-                prev = idx
-
-            text = "".join(chars)
-            results.append((text, probs, char_positions))
-
-        return results
-
-    def get_topk_chars_per_position(self, preds, char_list, k=20):
-        """
-        preds: (B, T, vocab)
-        return: list[B] -> list[T] -> list[(char, prob)]
-        """
-
-        if isinstance(preds, dict):
-            preds = preds["predict"]
-
-        probs = preds  # đảm bảo đã softmax
-
-        batch_topk = []
-
-        for b in range(probs.shape[0]):
-            seq = probs[b]  # (T, vocab)
-
-            # 🔥 lấy dư để tránh mất do blank
-            topk_idx = np.argsort(-seq, axis=1)[:, :k+5]
-            topk_prob = np.take_along_axis(seq, topk_idx, axis=1)
-
-            seq_result = []
-
-            for t in range(seq.shape[0]):
-                step = []
-
-                for i in range(topk_idx.shape[1]):
-                    idx = topk_idx[t][i]
-
-                    # skip blank
-                    if idx == 0:
-                        continue
-
-                    # ⚠️ check index mapping
-                    char = char_list[idx]  # hoặc idx-1 nếu cần
-                    prob = float(topk_prob[t][i])
-
-                    step.append((char, prob))
-
-                    # 🔥 đảm bảo đủ k
-                    if len(step) == k:
-                        break
-
-                seq_result.append(step)
-
-            batch_topk.append(seq_result)
-
-        return batch_topk
-
     def __call__(self, img_list):
         img_num = len(img_list)
         # Calculate the aspect ratio of all text bars
@@ -724,8 +629,7 @@ class TextRecognizer(object):
             width_list.append(img.shape[1] / float(img.shape[0]))
         # Sorting can speed up the recognition process
         indices = np.argsort(np.array(width_list))
-        # rec_res = [["", 0.0]] * img_num
-        rec_res = [None] * img_num
+        rec_res = [["", 0.0]] * img_num
         batch_num = self.rec_batch_num
         st = time.time()
         if self.benchmark:
@@ -821,12 +725,6 @@ class TextRecognizer(object):
                     word_label_list.append(word_label)
                 elif self.rec_algorithm == "LaTeXOCR":
                     norm_img = self.norm_img_latexocr(img_list[indices[ino]])
-                    norm_img = norm_img[np.newaxis, :]
-                    norm_img_batch.append(norm_img)
-                elif self.rec_algorithm == "SVTR_LCNet":
-                    norm_img = self.resize_norm_img_svtr_lcnet(
-                        img_list[indices[ino]], self.rec_image_shape
-                    )
                     norm_img = norm_img[np.newaxis, :]
                     norm_img_batch.append(norm_img)
                 else:
@@ -1006,7 +904,6 @@ class TextRecognizer(object):
                             rec_result, topk_batch
                         )
                     ]
-
             elif self.postprocess_params["name"] == "LaTeXOCRDecode":
                 preds = [p.reshape([-1]) for p in preds]
                 rec_result = self.postprocess_op(preds)
@@ -1044,7 +941,7 @@ def main(args):
     if args.warmup:
         img = np.random.uniform(0, 255, [48, 320, 3]).astype(np.uint8)
         for i in range(2):
-            text_recognizer([img] * int(args.rec_batch_num))
+            res = text_recognizer([img] * int(args.rec_batch_num))
 
     for image_file in image_file_list:
         img, flag, _ = check_and_read(image_file)
